@@ -99,6 +99,12 @@ typedef struct dhcp_packet_struct{
         char options[MAX_DHCP_OPTIONS_LENGTH]; /* DHCP options */
 }dhcp_packet;
 
+struct udp_dhcp_packet{
+        struct iphdr ip;
+        struct udphdr udp;
+        dhcp_packet data;
+};
+
 typedef struct offer_info_struct{
     struct in_addr offered_addr;
     u_int32_t xid;
@@ -141,17 +147,18 @@ int size_g;
 static cap_user appcaps;
 
 int get_hardware_address(int,char *);
-int send_dhcp_discover(int);
-int send_dhcp_request(int, offer_info);
-int send_dhcp_release(int, offer_info);
+u_int16_t checksum(void *addr, int count);
+int send_dhcp_discover(int, int);
+int send_dhcp_request(int, offer_info, int);
+int send_dhcp_release(int, offer_info, int);
 offer_info get_dhcp_offer(int);
 
 int dhcp_msg_type(dhcp_packet *offer_packet);
 uint32_t get_dhcp_server_identifier(dhcp_packet *offer_packet);
-int create_dhcp_socket(void);
+int create_dhcp_socket(int);
 int create_raw_socket(int);
 int close_dhcp_socket(int);
-int send_dhcp_packet(void *,int,int,struct sockaddr_in *);
+int send_dhcp_packet(void *,int,int,struct sockaddr_ll *);
 int receive_dhcp_packet(void *,int,int,int,struct sockaddr_in *);
 
 char* timestamputc(char* );
@@ -194,11 +201,18 @@ int main(int argc, char **argv){
     /* Create a separtae thread for performing SLAAC */
     pthread_create(&slaacthread, NULL, checkglobalipv6, NULL);
 
-    /* create socket for performing DORA */
-    dhcp_socket=create_dhcp_socket();
+    /* get ifindex */
+    ifindex = if_nametoindex(network_interface_name);
 
-    /* get HW address and the ifindex for creating raw socket */
-    ifindex = get_hardware_address(dhcp_socket,network_interface_name);
+    /* create socket for performing DORA */
+    dhcp_socket=create_dhcp_socket(ifindex);
+
+    /* get HW address for creating raw socket */
+    if(get_hardware_address(dhcp_socket,network_interface_name) == -1){
+        fprintf(xfinitylogfp,"%s : Failed to get hardware address\n",timestamputc(timestr));
+        fclose(xfinitylogfp);
+        return 0;
+    }
 
     raw_socket=create_raw_socket(ifindex);
     if(raw_socket == -1){
@@ -220,17 +234,17 @@ int main(int argc, char **argv){
     fprintf(xfinitylogfp,"%s : HOTSPOT_HEALTHCHECK : IPv4_XfinityHealthCheck_dora_start\n",timestamputc(timestr));
 
     /* send the DISCOVER packet out and wait for OFFER packet */
-    send_dhcp_discover(dhcp_socket);
+    send_dhcp_discover(dhcp_socket, ifindex);
     offinfo = get_dhcp_offer(raw_socket);
 
     if(offinfo.xid != 0){
         /* send the REQUEST packet out and wait for ACK packet */
-        send_dhcp_request(dhcp_socket,offinfo);
+        send_dhcp_request(dhcp_socket,offinfo, ifindex);
         ackinfo = get_dhcp_offer(raw_socket);
 
         if(ackinfo.xid != 0){
             fprintf(xfinitylogfp,"%s : HOTSPOT_HEALTHCHECK : IPv4_XfinityHealthCheck_completed, address assigned: %s \n",timestamputc(timestr), inet_ntoa(ackinfo.offered_addr));
-            send_dhcp_release(dhcp_socket,ackinfo);
+            send_dhcp_release(dhcp_socket,ackinfo, ifindex);
         }
         else{
             fprintf(xfinitylogfp,"%s : HOTSPOT_HEALTHCHECK : Server didnt send Ack. IPv4_XfinityHealthCheck_completed, address offered: %s \n",timestamputc(timestr), inet_ntoa(offinfo.offered_addr));
@@ -372,64 +386,59 @@ char* timestamputc(char *buf){
 
 int get_hardware_address(int sock,char *interface_name){
 
-    int ifindex;
     struct ifreq ifr;
 
     strncpy((char *)&ifr.ifr_name,interface_name,sizeof(ifr.ifr_name));
     /* get the hardware address of the test interface */
     if(ioctl(sock,SIOCGIFHWADDR,&ifr)<0){
         fprintf(xfinitylogfp,"Could not get the hardware address of interface '%s'\n",interface_name);
-        exit(-1);
+        return -1;
     }
     memcpy(&client_hardware_address[0],&ifr.ifr_hwaddr.sa_data,6);
 
-    if (ioctl(sock, SIOCGIFINDEX, &ifr) == 0) {
-        ifindex = ifr.ifr_ifindex;
-        return ifindex;
+    return 0;
+}
+
+u_int16_t checksum(void *addr, int count)
+{
+    register int32_t sum = 0;
+    u_int16_t *source = (u_int16_t *) addr;
+
+    while (count > 1) {
+        sum += *source++;
+        count -= 2;
     }
-    return -1;
+
+    if (count > 0) {
+    sum += *(unsigned char *) source;
+    }
+
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+
+    return ~sum;
 }
 
 /* Create a socket to send DHCP packets */
-int create_dhcp_socket(void){
-    struct sockaddr_in newsocket;
-    struct ifreq interface;
+int create_dhcp_socket(int ifindex){
+    struct sockaddr_ll newsocket;
     int sock;
-    int flag=1;
 
-    /* Listen on DHCP port for packets from any L3 address */
     memset(&newsocket,0,sizeof(newsocket));
-    newsocket.sin_family=AF_INET;
-    newsocket.sin_port=htons(DHCP_CLIENT_PORT);
-    newsocket.sin_addr.s_addr = INADDR_ANY;
-    memset(&newsocket.sin_zero,0,sizeof(newsocket.sin_zero));
+    newsocket.sll_family = AF_PACKET;
+    newsocket.sll_protocol = htons(ETH_P_IP);
+    newsocket.sll_ifindex = ifindex;
+    newsocket.sll_halen = 6;
+    memset(newsocket.sll_addr, 0xFF, 6);
 
-    sock=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+    sock=socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
     if(sock<0){
          fprintf(xfinitylogfp,"Error: Socket creation failed\n");
          exit(-1);
     }
 
-    flag=1;
-    /* set the broadcast option to receive broadcast packets */
-    if(setsockopt(sock,SOL_SOCKET,SO_BROADCAST,(char *)&flag,sizeof flag)<0){
-        fprintf(xfinitylogfp,"Error: Could not set broadcast option\n");
-        exit(-1);
-    }
-
-    if(setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char *)&flag,sizeof(flag))<0){
-        fprintf(xfinitylogfp,"Error: Could not set reuse address option\n");
-        exit(-1);
-    }
-
-    /* bind socket to interface */
-    strncpy(interface.ifr_ifrn.ifrn_name,network_interface_name,IFNAMSIZ);
-    if(setsockopt(sock,SOL_SOCKET,SO_BINDTODEVICE,(char *)&interface,sizeof(interface))<0){
-        fprintf(xfinitylogfp,"Error: Could not bind the socket to interface %s\n",network_interface_name);
-        exit(-1);
-    }
-
-        /* bind the socket */
+    /* bind the socket */
     if(bind(sock,(struct sockaddr *)&newsocket,sizeof(newsocket))<0){
         fprintf(xfinitylogfp,"Error: bind failed \n");
         exit(-1);
@@ -439,7 +448,7 @@ int create_dhcp_socket(void){
 }
 
 /* sends a DHCP packet */
-int send_dhcp_packet(void *buf, int buf_size, int sock, struct sockaddr_in *destaddr){
+int send_dhcp_packet(void *buf, int buf_size, int sock, struct sockaddr_ll *destaddr){
     int ret;
     ret=sendto(sock,(char *)buf,buf_size,0,(struct sockaddr *)destaddr,sizeof(*destaddr));
     if(ret<0)
@@ -448,40 +457,56 @@ int send_dhcp_packet(void *buf, int buf_size, int sock, struct sockaddr_in *dest
 }
 
 /* This functions send a DHCP discover packet */
-int send_dhcp_discover(int sock){
+int send_dhcp_discover(int sock, int ifindex){
     char timestr[30];
-    dhcp_packet dhcp_discover_packet;
-    struct sockaddr_in dest_sockaddr;
+    struct udp_dhcp_packet dhcp_discover_packet;
+    struct sockaddr_ll dest_sockaddr;
 
     memset(&dhcp_discover_packet,0,sizeof(dhcp_discover_packet));
 
-    dhcp_discover_packet.op=BOOTREQUEST;
-    dhcp_discover_packet.htype=ETHERNET_HARDWARE_ADDRESS;
-    dhcp_discover_packet.hlen=ETHERNET_HARDWARE_ADDRESS_LENGTH;
-    dhcp_discover_packet.hops=0;
+    dhcp_discover_packet.data.op=BOOTREQUEST;
+    dhcp_discover_packet.data.htype=ETHERNET_HARDWARE_ADDRESS;
+    dhcp_discover_packet.data.hlen=ETHERNET_HARDWARE_ADDRESS_LENGTH;
+    dhcp_discover_packet.data.hops=0;
     /* create a random transaction ID */
     srand(time(NULL));
     packet_xid=random();
-    dhcp_discover_packet.xid=htonl(packet_xid);
-    dhcp_discover_packet.secs=0;
+    dhcp_discover_packet.data.xid=htonl(packet_xid);
+    dhcp_discover_packet.data.secs=0;
     /* Broadcast flag is set */
-    dhcp_discover_packet.flags=htons(DHCP_BROADCAST_FLAG);
-    memcpy(dhcp_discover_packet.chaddr,client_hardware_address,ETHERNET_HARDWARE_ADDRESS_LENGTH);
+    dhcp_discover_packet.data.flags=htons(DHCP_BROADCAST_FLAG);
+    memcpy(dhcp_discover_packet.data.chaddr,client_hardware_address,ETHERNET_HARDWARE_ADDRESS_LENGTH);
     /* Magic cookie */
-    dhcp_discover_packet.options[0]='\x63';
-    dhcp_discover_packet.options[1]='\x82';
-    dhcp_discover_packet.options[2]='\x53';
-    dhcp_discover_packet.options[3]='\x63';
-    dhcp_discover_packet.options[4]=DHCP_OPTION_MESSAGE_TYPE;
-    dhcp_discover_packet.options[5]='\x01';
-    dhcp_discover_packet.options[6]=DHCPDISCOVER;
-    dhcp_discover_packet.options[7]=255;
+    dhcp_discover_packet.data.options[0]='\x63';
+    dhcp_discover_packet.data.options[1]='\x82';
+    dhcp_discover_packet.data.options[2]='\x53';
+    dhcp_discover_packet.data.options[3]='\x63';
+    dhcp_discover_packet.data.options[4]=DHCP_OPTION_MESSAGE_TYPE;
+    dhcp_discover_packet.data.options[5]='\x01';
+    dhcp_discover_packet.data.options[6]=DHCPDISCOVER;
+    dhcp_discover_packet.data.options[7]=255;
 
     /* The Discover packet must be broadcasted */
-    dest_sockaddr.sin_family=AF_INET;
-    dest_sockaddr.sin_port=htons(DHCP_SERVER_PORT);
-    dest_sockaddr.sin_addr.s_addr=INADDR_BROADCAST;
-    memset(&dest_sockaddr.sin_zero,0,sizeof(dest_sockaddr.sin_zero));
+    dest_sockaddr.sll_family = AF_PACKET;
+    dest_sockaddr.sll_protocol = htons(ETH_P_IP);
+    dest_sockaddr.sll_ifindex = ifindex;
+    dest_sockaddr.sll_halen = 6;
+    memset(dest_sockaddr.sll_addr, 0xFF, 6);
+
+    dhcp_discover_packet.ip.protocol = IPPROTO_UDP;
+    dhcp_discover_packet.ip.saddr = htonl(INADDR_ANY);
+    dhcp_discover_packet.ip.daddr = htonl(INADDR_BROADCAST);
+    dhcp_discover_packet.udp.source = htons(68);
+    dhcp_discover_packet.udp.dest = htons(67);
+    dhcp_discover_packet.udp.len = htons(sizeof(dhcp_discover_packet.udp) + sizeof(dhcp_packet));
+    dhcp_discover_packet.ip.tot_len = dhcp_discover_packet.udp.len;
+    dhcp_discover_packet.udp.check = checksum(&dhcp_discover_packet, sizeof(struct udp_dhcp_packet));
+
+    dhcp_discover_packet.ip.tot_len = htons(sizeof(struct udp_dhcp_packet));
+    dhcp_discover_packet.ip.ihl = sizeof(dhcp_discover_packet.ip) >> 2;
+    dhcp_discover_packet.ip.version = 4;
+    dhcp_discover_packet.ip.ttl = IPDEFTTL;
+    dhcp_discover_packet.ip.check = checksum(&(dhcp_discover_packet.ip), sizeof(dhcp_discover_packet.ip));
     send_dhcp_packet(&dhcp_discover_packet,sizeof(dhcp_discover_packet),sock,&dest_sockaddr);
     fprintf(xfinitylogfp,"%s : HOTSPOT_HEALTHCHECK : DISCOVER packet is sent\n",timestamputc(timestr));
 
@@ -489,53 +514,70 @@ int send_dhcp_discover(int sock){
 }
 
 /* sends a DHCPREQUEST broadcast message */
-int send_dhcp_request(int sock, offer_info offinfo){
-    dhcp_packet request_packet;
+int send_dhcp_request(int sock, offer_info offinfo, int ifindex){
+    struct udp_dhcp_packet request_packet;
     char timestr[30];
-    struct sockaddr_in dest_sockaddr;
+    struct sockaddr_ll dest_sockaddr;
 
     memset(&request_packet,0,sizeof(request_packet));
 
-    request_packet.op=BOOTREQUEST;
-    request_packet.htype=ETHERNET_HARDWARE_ADDRESS;
-    request_packet.hlen=ETHERNET_HARDWARE_ADDRESS_LENGTH;
-    request_packet.hops=0;
-    request_packet.xid=offinfo.xid;
-    request_packet.secs=0;
+    request_packet.data.op=BOOTREQUEST;
+    request_packet.data.htype=ETHERNET_HARDWARE_ADDRESS;
+    request_packet.data.hlen=ETHERNET_HARDWARE_ADDRESS_LENGTH;
+    request_packet.data.hops=0;
+    request_packet.data.xid=offinfo.xid;
+    request_packet.data.secs=0;
     /* Broadcast flag is set */
-    request_packet.flags=htons(DHCP_BROADCAST_FLAG);
-    memcpy(request_packet.chaddr,client_hardware_address,ETHERNET_HARDWARE_ADDRESS_LENGTH);
+    request_packet.data.flags=htons(DHCP_BROADCAST_FLAG);
+    memcpy(request_packet.data.chaddr,client_hardware_address,ETHERNET_HARDWARE_ADDRESS_LENGTH);
     /* Magic cookie */
-    request_packet.options[0]='\x63';
-    request_packet.options[1]='\x82';
-    request_packet.options[2]='\x53';
-    request_packet.options[3]='\x63';
+    request_packet.data.options[0]='\x63';
+    request_packet.data.options[1]='\x82';
+    request_packet.data.options[2]='\x53';
+    request_packet.data.options[3]='\x63';
     /* DHCP message type */
-    request_packet.options[4]=DHCP_OPTION_MESSAGE_TYPE;
-    request_packet.options[5]='\x01';
-    request_packet.options[6]=DHCPREQUEST;
+    request_packet.data.options[4]=DHCP_OPTION_MESSAGE_TYPE;
+    request_packet.data.options[5]='\x01';
+    request_packet.data.options[6]=DHCPREQUEST;
     /* the IP address we are requesting */
-    request_packet.options[7]=DHCP_OPTION_REQUESTED_ADDRESS;
-    request_packet.options[8]='\x04';
-    memcpy(&request_packet.options[9],&offinfo.offered_addr,sizeof(struct in_addr));
+    request_packet.data.options[7]=DHCP_OPTION_REQUESTED_ADDRESS;
+    request_packet.data.options[8]='\x04';
+    memcpy(&request_packet.data.options[9],&offinfo.offered_addr,sizeof(struct in_addr));
 
     if(offinfo.server_addr.s_addr != 0){
     /* the IP address of the server which sent the OFFER */
-        request_packet.options[13]=DHCP_OPTION_SERVER_IDENTIFIER;
-        request_packet.options[14]='\x04';
-        memcpy(&request_packet.options[15],&offinfo.server_addr,sizeof(struct in_addr));
+        request_packet.data.options[13]=DHCP_OPTION_SERVER_IDENTIFIER;
+        request_packet.data.options[14]='\x04';
+        memcpy(&request_packet.data.options[15],&offinfo.server_addr,sizeof(struct in_addr));
 
         /* End option */
-        request_packet.options[19]=255;
+        request_packet.data.options[19]=255;
     }
     else{
-        request_packet.options[13]=255;
+        request_packet.data.options[13]=255;
     }
-    /* Broadcast the DHCPREQUEST packet */
-    dest_sockaddr.sin_family=AF_INET;
-    dest_sockaddr.sin_port=htons(DHCP_SERVER_PORT);
-    dest_sockaddr.sin_addr.s_addr=INADDR_BROADCAST;
-    memset(&dest_sockaddr.sin_zero,0,sizeof(dest_sockaddr.sin_zero));
+
+    dest_sockaddr.sll_family = AF_PACKET;
+    dest_sockaddr.sll_protocol = htons(ETH_P_IP);
+    dest_sockaddr.sll_ifindex = ifindex;
+    dest_sockaddr.sll_halen = 6;
+    memset(dest_sockaddr.sll_addr, 0xFF, 6);
+
+    request_packet.ip.protocol = IPPROTO_UDP;
+    request_packet.ip.saddr = htonl(INADDR_ANY);
+    request_packet.ip.daddr = htonl(INADDR_BROADCAST);
+    request_packet.udp.source = htons(68);
+    request_packet.udp.dest = htons(67);
+    request_packet.udp.len = htons(sizeof(request_packet.udp) + sizeof(dhcp_packet));
+    request_packet.ip.tot_len = request_packet.udp.len;
+    request_packet.udp.check = checksum(&request_packet, sizeof(struct udp_dhcp_packet));
+
+    request_packet.ip.tot_len = htons(sizeof(struct udp_dhcp_packet));
+    request_packet.ip.ihl = sizeof(request_packet.ip) >> 2;
+    request_packet.ip.version = 4;
+    request_packet.ip.ttl = IPDEFTTL;
+    request_packet.ip.check = checksum(&(request_packet.ip), sizeof(request_packet.ip));
+
     send_dhcp_packet(&request_packet,sizeof(request_packet),sock,&dest_sockaddr);
     fprintf(xfinitylogfp,"%s : HOTSPOT_HEALTHCHECK : REQUEST packet is sent\n",timestamputc(timestr));
 
@@ -543,50 +585,67 @@ int send_dhcp_request(int sock, offer_info offinfo){
 }
 
 /* sends a DHCPRELEASE message */
-int send_dhcp_release(int sock, offer_info ackinfo){
+int send_dhcp_release(int sock, offer_info ackinfo, int ifindex){
     char timestr[30];
-    dhcp_packet release_packet;
-    struct sockaddr_in sockaddr_server;
+    struct udp_dhcp_packet release_packet;
+    struct sockaddr_ll sockaddr_server;
 
     memset(&release_packet,0,sizeof(release_packet));
-    release_packet.op=BOOTREQUEST;
-    release_packet.htype=ETHERNET_HARDWARE_ADDRESS;
-    release_packet.hlen=ETHERNET_HARDWARE_ADDRESS_LENGTH;
-    release_packet.hops=0;
+    release_packet.data.op=BOOTREQUEST;
+    release_packet.data.htype=ETHERNET_HARDWARE_ADDRESS;
+    release_packet.data.hlen=ETHERNET_HARDWARE_ADDRESS_LENGTH;
+    release_packet.data.hops=0;
     /* A random transaction ID is generated */
     srand(time(NULL));
     packet_xid=random();
-    release_packet.xid=htonl(packet_xid);
-    release_packet.secs=0;
+    release_packet.data.xid=htonl(packet_xid);
+    release_packet.data.secs=0;
     /* Broadcast flag is set */
-    release_packet.flags=htons(DHCP_BROADCAST_FLAG);
-    memcpy(release_packet.chaddr,client_hardware_address,ETHERNET_HARDWARE_ADDRESS_LENGTH);
+    release_packet.data.flags=htons(DHCP_BROADCAST_FLAG);
+    memcpy(release_packet.data.chaddr,client_hardware_address,ETHERNET_HARDWARE_ADDRESS_LENGTH);
     /* Magic cookie */
-    release_packet.options[0]='\x63';
-    release_packet.options[1]='\x82';
-    release_packet.options[2]='\x53';
-    release_packet.options[3]='\x63';
+    release_packet.data.options[0]='\x63';
+    release_packet.data.options[1]='\x82';
+    release_packet.data.options[2]='\x53';
+    release_packet.data.options[3]='\x63';
     /* DHCP message type */
-    release_packet.options[4]=DHCP_OPTION_MESSAGE_TYPE;
-    release_packet.options[5]='\x01';
-    release_packet.options[6]=DHCPRELEASE;
+    release_packet.data.options[4]=DHCP_OPTION_MESSAGE_TYPE;
+    release_packet.data.options[5]='\x01';
+    release_packet.data.options[6]=DHCPRELEASE;
 
     if(ackinfo.server_addr.s_addr != 0){
         /* the IP address of the server */
-        release_packet.options[7]=DHCP_OPTION_SERVER_IDENTIFIER;
-        release_packet.options[8]='\x04';
-        memcpy(&release_packet.options[9],&ackinfo.server_addr,sizeof(struct in_addr));
+        release_packet.data.options[7]=DHCP_OPTION_SERVER_IDENTIFIER;
+        release_packet.data.options[8]='\x04';
+        memcpy(&release_packet.data.options[9],&ackinfo.server_addr,sizeof(struct in_addr));
         /* END option */
-        release_packet.options[13]=255;
+        release_packet.data.options[13]=255;
     }
     else{
-        release_packet.options[7]=255;
+        release_packet.data.options[7]=255;
     }
     /* send the DHCPRELEASE packet to server address */
-    sockaddr_server.sin_family=AF_INET;
-    sockaddr_server.sin_port=htons(DHCP_SERVER_PORT);
-    sockaddr_server.sin_addr.s_addr=ackinfo.server_addr.s_addr;
-    memset(&sockaddr_server.sin_zero,0,sizeof(sockaddr_server.sin_zero));
+    sockaddr_server.sll_family = AF_PACKET;
+    sockaddr_server.sll_protocol = htons(ETH_P_IP);
+    sockaddr_server.sll_ifindex = ifindex;
+    sockaddr_server.sll_halen = 6;
+    memset(sockaddr_server.sll_addr, 0xFF, 6);
+
+    release_packet.ip.protocol = IPPROTO_UDP;
+    release_packet.ip.saddr = htonl(INADDR_ANY);
+    release_packet.ip.daddr = htonl(INADDR_BROADCAST);
+    release_packet.udp.source = htons(68);
+    release_packet.udp.dest = htons(67);
+    release_packet.udp.len = htons(sizeof(release_packet.udp) + sizeof(dhcp_packet));
+    release_packet.ip.tot_len = release_packet.udp.len;
+    release_packet.udp.check = checksum(&release_packet, sizeof(struct udp_dhcp_packet));
+
+    release_packet.ip.tot_len = htons(sizeof(struct udp_dhcp_packet));
+    release_packet.ip.ihl = sizeof(release_packet.ip) >> 2;
+    release_packet.ip.version = 4;
+    release_packet.ip.ttl = IPDEFTTL;
+    release_packet.ip.check = checksum(&(release_packet.ip), sizeof(release_packet.ip));
+
     send_dhcp_packet(&release_packet,sizeof(release_packet),sock,&sockaddr_server);
     fprintf(xfinitylogfp,"%s : HOTSPOT_HEALTHCHECK : RELEASE packet is sent\n",timestamputc(timestr));
 
